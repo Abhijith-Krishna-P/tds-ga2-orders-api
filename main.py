@@ -7,34 +7,33 @@ from collections import deque
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from starlette.middleware.cors import CORSMiddleware
 
 EMAIL = "24f2005862@ds.study.iitm.ac.in"
 TOTAL_ORDERS = 46
 RATE_LIMIT = 16
 WINDOW_SECONDS = 10.0
 
-app = FastAPI(title="TDS GA2 Orders API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["Retry-After"],
-    allow_credentials=False,
-)
+api = FastAPI(title="TDS GA2 Orders API")
 
 lock = threading.Lock()
 
+# Fixed catalog: IDs 1 through 46.
 CATALOG = [
-    {"id": i, "item": f"Order item {i}", "amount": round(10.0 + i * 2.5, 2)}
+    {
+        "id": i,
+        "item": f"Order item {i}",
+        "amount": round(10.0 + i * 2.5, 2),
+    }
     for i in range(1, TOTAL_ORDERS + 1)
 ]
 
+# Idempotency-Key -> order.
 idempotency_store = {}
+
+# Client ID -> timestamps of recent requests.
 request_times = {}
 
 
@@ -43,7 +42,7 @@ class OrderRequest(BaseModel):
     quantity: int = Field(default=1, ge=1)
 
 
-def enforce_rate_limit(client_id: str):
+def enforce_rate_limit(client_id: str) -> None:
     now = time.monotonic()
 
     with lock:
@@ -66,8 +65,9 @@ def enforce_rate_limit(client_id: str):
         timestamps.append(now)
 
 
-@app.middleware("http")
+@api.middleware("http")
 async def client_rate_limit(request: Request, call_next):
+    # CORS preflight requests must not consume rate-limit tokens.
     if request.method == "OPTIONS":
         return await call_next(request)
 
@@ -85,20 +85,24 @@ async def client_rate_limit(request: Request, call_next):
     return await call_next(request)
 
 
-@app.get("/")
+@api.get("/")
 def health():
     return {"status": "ok", "email": EMAIL}
 
 
-@app.post("/orders", status_code=201)
+@api.post("/orders", status_code=201)
 def create_order(
     body: OrderRequest,
     idempotency_key: Optional[str] = Header(
-        default=None, alias="Idempotency-Key"
+        default=None,
+        alias="Idempotency-Key",
     ),
 ):
     if not idempotency_key or not idempotency_key.strip():
-        raise HTTPException(status_code=400, detail="Idempotency-Key header is required")
+        raise HTTPException(
+            status_code=400,
+            detail="Idempotency-Key header is required",
+        )
 
     key = idempotency_key.strip()
 
@@ -113,11 +117,12 @@ def create_order(
             "quantity": body.quantity,
             "status": "created",
         }
+
         idempotency_store[key] = order
         return order
 
 
-@app.get("/orders")
+@api.get("/orders")
 def list_orders(
     limit: int = Query(default=10, ge=1, le=100),
     cursor: Optional[str] = Query(default=None),
@@ -126,8 +131,11 @@ def list_orders(
 
     if cursor:
         try:
-            padded = cursor + "=" * (-len(cursor) % 4)
-            offset = int(base64.urlsafe_b64decode(padded.encode()).decode())
+            padded_cursor = cursor + "=" * (-len(cursor) % 4)
+            offset = int(
+                base64.urlsafe_b64decode(padded_cursor.encode()).decode()
+            )
+
             if offset < 0 or offset > TOTAL_ORDERS:
                 raise ValueError
         except (ValueError, UnicodeError, TypeError):
@@ -142,4 +150,19 @@ def list_orders(
             str(next_offset).encode()
         ).decode().rstrip("=")
 
-    return {"items": items, "next_cursor": next_cursor}
+    return {
+        "items": items,
+        "next_cursor": next_cursor,
+    }
+
+
+# Wrap the complete application OUTSIDE the rate-limit middleware.
+# This ensures CORS headers are added even to HTTP 429 responses.
+app = CORSMiddleware(
+    app=api,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Retry-After"],
+    allow_credentials=False,
+)
