@@ -1,3 +1,4 @@
+import base64
 import math
 import threading
 import time
@@ -7,6 +8,7 @@ from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 EMAIL = "24f2005862@ds.study.iitm.ac.in"
@@ -21,24 +23,18 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Retry-After"],
+    allow_credentials=False,
 )
 
 lock = threading.Lock()
 
-# Fixed catalog: IDs 1 through 46.
 CATALOG = [
-    {
-        "id": i,
-        "item": f"Order item {i}",
-        "amount": round(10.0 + i * 2.5, 2),
-    }
+    {"id": i, "item": f"Order item {i}", "amount": round(10.0 + i * 2.5, 2)}
     for i in range(1, TOTAL_ORDERS + 1)
 ]
 
-# Idempotency-Key -> created order.
 idempotency_store = {}
-
-# Client ID -> timestamps of recent requests.
 request_times = {}
 
 
@@ -47,7 +43,7 @@ class OrderRequest(BaseModel):
     quantity: int = Field(default=1, ge=1)
 
 
-def enforce_rate_limit(client_id: str) -> None:
+def enforce_rate_limit(client_id: str):
     now = time.monotonic()
 
     with lock:
@@ -72,19 +68,14 @@ def enforce_rate_limit(client_id: str) -> None:
 
 @app.middleware("http")
 async def client_rate_limit(request: Request, call_next):
-    # Do not consume rate-limit tokens for CORS preflight requests.
     if request.method == "OPTIONS":
         return await call_next(request)
 
-    client_id = request.headers.get("X-Client-Id", "").strip()
-    if not client_id:
-        client_id = "anonymous"
+    client_id = request.headers.get("X-Client-Id", "").strip() or "anonymous"
 
     try:
         enforce_rate_limit(client_id)
     except HTTPException as exc:
-        from fastapi.responses import JSONResponse
-
         return JSONResponse(
             status_code=exc.status_code,
             content={"detail": exc.detail},
@@ -103,15 +94,11 @@ def health():
 def create_order(
     body: OrderRequest,
     idempotency_key: Optional[str] = Header(
-        default=None,
-        alias="Idempotency-Key",
+        default=None, alias="Idempotency-Key"
     ),
 ):
     if not idempotency_key or not idempotency_key.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Idempotency-Key header is required",
-        )
+        raise HTTPException(status_code=400, detail="Idempotency-Key header is required")
 
     key = idempotency_key.strip()
 
@@ -135,35 +122,24 @@ def list_orders(
     limit: int = Query(default=10, ge=1, le=100),
     cursor: Optional[str] = Query(default=None),
 ):
-    # The cursor is an opaque URL-safe offset token.
     offset = 0
 
     if cursor:
         try:
-            import base64
-
-            decoded = base64.urlsafe_b64decode(
-                cursor.encode("ascii") + b"=" * (-len(cursor) % 4)
-            ).decode("ascii")
-            offset = int(decoded)
+            padded = cursor + "=" * (-len(cursor) % 4)
+            offset = int(base64.urlsafe_b64decode(padded.encode()).decode())
             if offset < 0 or offset > TOTAL_ORDERS:
                 raise ValueError
         except (ValueError, UnicodeError, TypeError):
             raise HTTPException(status_code=400, detail="Invalid cursor")
 
-    items = CATALOG[offset : offset + limit]
+    items = CATALOG[offset:offset + limit]
     next_offset = offset + len(items)
 
+    next_cursor = None
     if next_offset < TOTAL_ORDERS:
-        import base64
-
         next_cursor = base64.urlsafe_b64encode(
-            str(next_offset).encode("ascii")
-        ).decode("ascii").rstrip("=")
-    else:
-        next_cursor = None
+            str(next_offset).encode()
+        ).decode().rstrip("=")
 
-    return {
-        "items": items,
-        "next_cursor": next_cursor,
-    }
+    return {"items": items, "next_cursor": next_cursor}
